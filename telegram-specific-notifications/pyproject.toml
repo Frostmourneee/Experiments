@@ -1,7 +1,6 @@
 [project]
 name = "telegram-specific-notifications"
 version = "0.1.0"
-description = "Add your description here"
 readme = "README.md"
 authors = [
     { name = "Frostmourneee", email = "wellthx1@gmail.com" }
