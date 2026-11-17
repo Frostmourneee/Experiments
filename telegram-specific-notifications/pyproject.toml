@@ -6,7 +6,9 @@ authors = [
     { name = "Frostmourneee", email = "wellthx1@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "telethon>=1.45.0",
+]
 
 [project.scripts]
 telegram-specific-notifications = "telegram_specific_notifications:main"
