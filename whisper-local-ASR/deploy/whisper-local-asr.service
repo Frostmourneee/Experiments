@@ -3,7 +3,7 @@ Description=Warm local Whisper ASR daemon
 
 [Service]
 Type=simple
-WorkingDirectory=/home/frostmourneee/Progs/Experiments/whisper-local-ASR
-ExecStart=/home/frostmourneee/Progs/Experiments/whisper-local-ASR/.venv/bin/python -u -m whisper_local_asr.daemon
+ExecStart=/home/frostmourneee/.local/bin/whisper-local-asr-daemon
+Environment=PYTHONUNBUFFERED=1
 KillMode=control-group
 TimeoutStopSec=15
