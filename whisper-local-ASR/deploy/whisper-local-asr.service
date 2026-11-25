@@ -1,0 +1,9 @@
+[Unit]
+Description=Warm local Whisper ASR daemon
+
+[Service]
+Type=simple
+WorkingDirectory=/home/frostmourneee/Progs/Experiments/whisper-local-ASR
+ExecStart=/home/frostmourneee/Progs/Experiments/whisper-local-ASR/.venv/bin/python -u -m whisper_local_asr.daemon
+KillMode=control-group
+TimeoutStopSec=15

@@ -1,0 +1,30 @@
+[project]
+name = "whisper-local-asr"
+version = "0.1.0"
+description = "Local English ASR experiments with faster-whisper"
+readme = "README.md"
+authors = [
+    { name = "Frostmourneee", email = "wellthx1@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "av>=11,<19",
+    "faster-whisper",
+    "nvidia-ml-py",
+    "nvidia-cublas-cu12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "nvidia-cudnn-cu12; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "psutil",
+]
+
+[project.scripts]
+whisper-local-asr = "whisper_local_asr.cli:main"
+whisper-local-asr-client = "whisper_local_asr.client:main"
+whisper-local-asr-daemon = "whisper_local_asr.daemon:main"
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14.0"]
+build-backend = "uv_build"

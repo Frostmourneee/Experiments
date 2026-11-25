@@ -1,0 +1,4 @@
+#!/bin/sh
+
+systemctl --user start whisper-local-asr.service
+exec /home/frostmourneee/.local/bin/neovide --fork "$@"
