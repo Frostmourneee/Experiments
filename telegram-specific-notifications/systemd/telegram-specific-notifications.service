@@ -1,0 +1,20 @@
+[Unit]
+Description=Selective Telegram notifications
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/telegram-specific-notifications/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/bin/telegram-specific-notifications run
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=15s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=graphical-session.target

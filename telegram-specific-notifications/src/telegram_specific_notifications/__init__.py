@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from telegram-specific-notifications!")
+"""Selective Telegram notifications for Ubuntu."""

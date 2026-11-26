@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.scripts]
-telegram-specific-notifications = "telegram_specific_notifications:main"
+telegram-specific-notifications = "telegram_specific_notifications.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.13.8,<0.14.0"]
