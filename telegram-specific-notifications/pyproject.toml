@@ -13,6 +13,10 @@ dependencies = [
 [project.scripts]
 telegram-specific-notifications = "telegram_specific_notifications.cli:main"
 
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
 [build-system]
 requires = ["uv_build>=0.13.8,<0.14.0"]
 build-backend = "uv_build"
