@@ -1,5 +1,7 @@
 # whisper-local-asr
 
+**[unfinished for sharing however easy to be finished locally manually/with AI]**
+
 Local English transcription with `faster-whisper`, plus a warm background
 daemon used by Neovim/Neovide and a system-wide clipboard dictation command.
 
