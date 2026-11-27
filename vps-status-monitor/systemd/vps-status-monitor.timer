@@ -1,0 +1,11 @@
+[Unit]
+Description=Check VPS reachability every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=1s
+Unit=vps-status-monitor.service
+
+[Install]
+WantedBy=timers.target

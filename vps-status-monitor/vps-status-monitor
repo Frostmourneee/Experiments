@@ -1,0 +1,716 @@
+#!/usr/bin/env python3
+"""Small ICMP availability monitor for two VPS hosts."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Optional, Sequence
+
+
+APP_NAME = "vps-status-monitor"
+PACKET_COUNT = 3
+PING_REPLY_TIMEOUT_SECONDS = 2
+PING_PROCESS_TIMEOUT_SECONDS = 12
+CHECK_INTERVAL_SECONDS = 60
+MAX_EXPECTED_GAP_SECONDS = 150
+
+
+@dataclass(frozen=True)
+class Target:
+    name: str
+    address: str
+
+# Configure before using
+TARGETS = (
+    # Target("first", "42.42.42.42"),
+    # Target("secodn", "43.43.43.43"),
+)
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    target: Target
+    status: str
+    packets_sent: Optional[int]
+    packets_received: Optional[int]
+    avg_rtt_ms: Optional[float]
+    error: Optional[str] = None
+    interface: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Outage:
+    target: str
+    started_at: int
+    ended_at: Optional[int]
+    last_down_at: int
+    end_reason: str
+
+
+PACKET_SUMMARY_RE = re.compile(
+    r"(?P<sent>\d+)\s+packets?\s+transmitted,\s+"
+    r"(?P<received>\d+)(?:\s+packets?)?\s+received",
+    re.IGNORECASE,
+)
+RTT_RE = re.compile(
+    r"(?:rtt|round-trip)[^=]*=\s*"
+    r"[0-9.]+/(?P<average>[0-9.]+)/[0-9.]+(?:/[0-9.]+)?\s*ms",
+    re.IGNORECASE,
+)
+DURATION_RE = re.compile(r"^(?P<amount>\d+)\s*(?P<unit>[smhdw])$", re.IGNORECASE)
+
+
+def default_database_path() -> Path:
+    override = os.environ.get("VPS_STATUS_MONITOR_DB")
+    if override:
+        return Path(override).expanduser()
+
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home).expanduser() / APP_NAME / "monitor.db"
+    return Path.home() / ".local" / "state" / APP_NAME / "monitor.db"
+
+
+def parse_duration(value: str) -> int:
+    match = DURATION_RE.fullmatch(value.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(
+            "duration must be an integer followed by s, m, h, d, or w (for example: 24h or 7d)"
+        )
+
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    seconds = int(match.group("amount")) * multipliers[match.group("unit").lower()]
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("duration must be greater than zero")
+    return seconds
+
+
+def concise_error(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return (lines[-1] if lines else "ping failed")[:500]
+
+
+def parse_base_interface(route_output: str) -> Optional[str]:
+    candidates: list[tuple[int, int, str]] = []
+    for position, line in enumerate(route_output.splitlines()):
+        fields = line.split()
+        if not fields or fields[0] != "default" or "dev" not in fields:
+            continue
+        device_position = fields.index("dev") + 1
+        if device_position >= len(fields):
+            continue
+        metric = 0
+        if "metric" in fields:
+            metric_position = fields.index("metric") + 1
+            if metric_position < len(fields):
+                try:
+                    metric = int(fields[metric_position])
+                except ValueError:
+                    metric = 0
+        candidates.append((metric, position, fields[device_position]))
+
+    if not candidates:
+        return None
+    return min(candidates)[2]
+
+
+def find_base_interface(requested: str) -> tuple[Optional[str], Optional[str]]:
+    if requested and requested != "auto":
+        return requested, None
+
+    try:
+        completed = subprocess.run(
+            ["ip", "-4", "route", "show", "default", "table", "main"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={**os.environ, "LC_ALL": "C"},
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, "'ip' was not found; set --interface explicitly"
+    except subprocess.TimeoutExpired:
+        return None, "timed out while discovering the base network interface"
+    except OSError as error:
+        return None, f"could not discover the base network interface: {error}"
+
+    if completed.returncode != 0:
+        return None, "could not read the main routing table: " + concise_error(
+            completed.stderr or completed.stdout
+        )
+    interface = parse_base_interface(completed.stdout)
+    if interface is None:
+        return None, "the main routing table has no IPv4 default interface"
+    return interface, None
+
+
+def interpret_ping_result(
+    target: Target,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    interface: Optional[str] = None,
+) -> ProbeResult:
+    output = "\n".join(part for part in (stdout, stderr) if part)
+    summary = PACKET_SUMMARY_RE.search(output)
+
+    # ping uses 1 for no replies and 2 for local/configuration errors. A local
+    # error must not be mistaken for an unreachable VPS.
+    if returncode not in (0, 1) or summary is None:
+        return ProbeResult(
+            target, "unknown", None, None, None, concise_error(output), interface
+        )
+
+    sent = int(summary.group("sent"))
+    received = int(summary.group("received"))
+    if sent != PACKET_COUNT or received < 0 or received > sent:
+        return ProbeResult(
+            target,
+            "unknown",
+            sent,
+            received,
+            None,
+            f"ping sent {sent} packets; expected {PACKET_COUNT}",
+            interface,
+        )
+
+    rtt_match = RTT_RE.search(output)
+    avg_rtt = float(rtt_match.group("average")) if rtt_match else None
+    status = "down" if received == 0 else "up"
+    return ProbeResult(target, status, sent, received, avg_rtt, None, interface)
+
+
+def probe_target(target: Target, interface: str) -> ProbeResult:
+    ping_command = os.environ.get("VPS_STATUS_MONITOR_PING", "ping")
+    command = [
+        ping_command,
+        "-n",
+        "-q",
+        "-c",
+        str(PACKET_COUNT),
+        "-W",
+        str(PING_REPLY_TIMEOUT_SECONDS),
+        "-I",
+        interface,
+        target.address,
+    ]
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=PING_PROCESS_TIMEOUT_SECONDS,
+            env=environment,
+            check=False,
+        )
+    except FileNotFoundError:
+        return ProbeResult(
+            target,
+            "unknown",
+            None,
+            None,
+            None,
+            f"{ping_command!r} was not found",
+            interface,
+        )
+    except subprocess.TimeoutExpired:
+        return ProbeResult(
+            target,
+            "unknown",
+            None,
+            None,
+            None,
+            f"ping process exceeded {PING_PROCESS_TIMEOUT_SECONDS}s",
+            interface,
+        )
+    except OSError as error:
+        return ProbeResult(target, "unknown", None, None, None, str(error), interface)
+
+    return interpret_ping_result(
+        target, completed.returncode, completed.stdout, completed.stderr, interface
+    )
+
+
+def open_database(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA busy_timeout = 10000")
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS samples (
+            id               INTEGER PRIMARY KEY,
+            checked_at       INTEGER NOT NULL,
+            target           TEXT NOT NULL,
+            address          TEXT NOT NULL,
+            status           TEXT NOT NULL CHECK (status IN ('up', 'down', 'unknown')),
+            packets_sent     INTEGER,
+            packets_received INTEGER,
+            avg_rtt_ms       REAL,
+            error            TEXT,
+            interface        TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS samples_target_time_idx
+            ON samples (target, checked_at, id);
+        """
+    )
+    columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(samples)")
+    }
+    if "interface" not in columns:
+        connection.execute("ALTER TABLE samples ADD COLUMN interface TEXT")
+        connection.commit()
+    return connection
+
+
+def save_results(
+    connection: sqlite3.Connection, checked_at: int, results: Sequence[ProbeResult]
+) -> None:
+    rows = [
+        (
+            checked_at,
+            result.target.name,
+            result.target.address,
+            result.status,
+            result.packets_sent,
+            result.packets_received,
+            result.avg_rtt_ms,
+            result.error,
+            result.interface,
+        )
+        for result in results
+    ]
+    with connection:
+        connection.executemany(
+            """
+            INSERT INTO samples (
+                checked_at, target, address, status, packets_sent,
+                packets_received, avg_rtt_ms, error, interface
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+
+def loss_text(sent: Optional[int], received: Optional[int]) -> str:
+    if sent is None or received is None or sent == 0:
+        return "-"
+    percentage = round((sent - received) * 100 / sent)
+    return f"{percentage}%"
+
+
+def rtt_text(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value:.1f} ms"
+
+
+def format_timestamp(timestamp: int) -> str:
+    date = datetime.fromtimestamp(timestamp, timezone.utc).astimezone()
+    return date.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def format_span(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s" if seconds else f"{minutes}m"
+    return f"{seconds}s"
+
+
+def print_table(headers: Sequence[str], rows: Iterable[Sequence[object]]) -> None:
+    string_rows = [[str(value) for value in row] for row in rows]
+    widths = [len(header) for header in headers]
+    for row in string_rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+
+    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    for row in string_rows:
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+
+
+def command_check(args: argparse.Namespace) -> int:
+    checked_at = int(time.time())
+    interface, interface_error = find_base_interface(args.interface)
+    if interface is None:
+        results = [
+            ProbeResult(target, "unknown", None, None, None, interface_error)
+            for target in TARGETS
+        ]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(TARGETS)) as executor:
+            futures = {
+                target: executor.submit(probe_target, target, interface)
+                for target in TARGETS
+            }
+            results = []
+            for target in TARGETS:
+                try:
+                    results.append(futures[target].result())
+                except Exception as error:  # Preserve the other target's measurement.
+                    results.append(
+                        ProbeResult(
+                            target,
+                            "unknown",
+                            None,
+                            None,
+                            None,
+                            str(error),
+                            interface,
+                        )
+                    )
+
+    with open_database(args.database) as connection:
+        save_results(connection, checked_at, results)
+
+    for result in results:
+        is_partial = (
+            result.packets_sent is not None
+            and result.packets_received is not None
+            and result.packets_received < result.packets_sent
+            and result.packets_received > 0
+        )
+        if args.quiet and result.status == "up" and not is_partial:
+            continue
+        details = result.error or (
+            f"{result.packets_received}/{result.packets_sent} replies, "
+            f"average {rtt_text(result.avg_rtt_ms)}"
+        )
+        print(
+            f"{format_timestamp(checked_at)}  {result.target.name:<10}  "
+            f"{result.status.upper():<7}  via {result.interface or '-'}  {details}"
+        )
+
+    # A remote outage is valid monitoring data, so it must not make the
+    # systemd oneshot unit fail.
+    return 0
+
+
+def latest_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(
+        connection.execute(
+            """
+            SELECT s.*
+            FROM samples AS s
+            WHERE s.id = (
+                SELECT newest.id
+                FROM samples AS newest
+                WHERE newest.target = s.target
+                ORDER BY newest.checked_at DESC, newest.id DESC
+                LIMIT 1
+            )
+            """
+        )
+    )
+
+
+def command_status(args: argparse.Namespace) -> int:
+    with open_database(args.database) as connection:
+        rows = latest_rows(connection)
+
+    if not rows:
+        print("No checks have been recorded yet. Run: vps-status-monitor check")
+        return 0
+
+    order = {target.name: index for index, target in enumerate(TARGETS)}
+    rows.sort(key=lambda row: order.get(row["target"], len(order)))
+    now = int(time.time())
+    output_rows = []
+    for row in rows:
+        age = now - row["checked_at"]
+        state = row["status"].upper()
+        if age > MAX_EXPECTED_GAP_SECONDS:
+            state += " (STALE)"
+        output_rows.append(
+            (
+                row["target"],
+                row["address"],
+                row["interface"] or "-",
+                state,
+                loss_text(row["packets_sent"], row["packets_received"]),
+                rtt_text(row["avg_rtt_ms"]),
+                format_timestamp(row["checked_at"]),
+                format_span(age) + " ago",
+            )
+        )
+
+    print_table(
+        (
+            "TARGET",
+            "ADDRESS",
+            "VIA",
+            "STATUS",
+            "LOSS",
+            "AVG RTT",
+            "LAST CHECK",
+            "AGE",
+        ),
+        output_rows,
+    )
+    return 0
+
+
+def build_outages(
+    rows: Iterable[sqlite3.Row], now: int
+) -> list[Outage]:
+    outages: list[Outage] = []
+    active_target: Optional[str] = None
+    started_at: Optional[int] = None
+    last_down_at: Optional[int] = None
+    previous_at: Optional[int] = None
+
+    def finish(ended_at: Optional[int], reason: str) -> None:
+        nonlocal started_at, last_down_at
+        if started_at is not None and last_down_at is not None and active_target is not None:
+            outages.append(
+                Outage(active_target, started_at, ended_at, last_down_at, reason)
+            )
+        started_at = None
+        last_down_at = None
+
+    for row in rows:
+        target = row["target"]
+        checked_at = row["checked_at"]
+        status = row["status"]
+
+        if target != active_target:
+            if active_target is not None:
+                reason = (
+                    "ongoing"
+                    if previous_at is not None and now - previous_at <= MAX_EXPECTED_GAP_SECONDS
+                    else "data gap"
+                )
+                finish(None, reason)
+            active_target = target
+            previous_at = None
+
+        if (
+            previous_at is not None
+            and checked_at - previous_at > MAX_EXPECTED_GAP_SECONDS
+        ):
+            finish(None, "data gap")
+
+        if status == "down":
+            if started_at is None:
+                started_at = checked_at
+            last_down_at = checked_at
+        elif started_at is not None:
+            finish(checked_at, "recovered" if status == "up" else "check error")
+
+        previous_at = checked_at
+
+    if active_target is not None:
+        reason = (
+            "ongoing"
+            if previous_at is not None and now - previous_at <= MAX_EXPECTED_GAP_SECONDS
+            else "data gap"
+        )
+        finish(None, reason)
+    return outages
+
+
+def command_outages(args: argparse.Namespace) -> int:
+    now = int(time.time())
+    cutoff = now - args.since
+    # Samples written before interface binding was introduced cannot prove that
+    # they bypassed the VPN, so treat them as unknown rather than as outages.
+    query = (
+        "SELECT target, checked_at, "
+        "CASE WHEN interface IS NULL THEN 'unknown' ELSE status END AS status "
+        "FROM samples"
+    )
+    parameters: tuple[object, ...] = ()
+    if args.target:
+        query += " WHERE target = ?"
+        parameters = (args.target,)
+    query += " ORDER BY target, checked_at, id"
+
+    with open_database(args.database) as connection:
+        outages = build_outages(connection.execute(query, parameters), now)
+
+    visible = []
+    for outage in outages:
+        effective_end = (
+            outage.ended_at
+            if outage.ended_at is not None
+            else (now if outage.end_reason == "ongoing" else outage.last_down_at)
+        )
+        if effective_end >= cutoff:
+            visible.append(outage)
+    visible.sort(key=lambda outage: outage.started_at, reverse=True)
+
+    if not visible:
+        scope = f" for {args.target}" if args.target else ""
+        print(f"No unreachable intervals{scope} in the requested period.")
+        return 0
+
+    output_rows = []
+    for outage in visible:
+        if outage.end_reason == "ongoing":
+            end_text = "ONGOING"
+            duration = "~" + format_span(now - outage.started_at)
+        elif outage.end_reason == "data gap":
+            end_text = "unknown after " + format_timestamp(outage.last_down_at)
+            duration = "unknown"
+        else:
+            assert outage.ended_at is not None
+            suffix = "" if outage.end_reason == "recovered" else " (check error)"
+            end_text = format_timestamp(outage.ended_at) + suffix
+            duration = "~" + format_span(outage.ended_at - outage.started_at)
+        output_rows.append(
+            (
+                outage.target,
+                format_timestamp(outage.started_at),
+                end_text,
+                duration,
+            )
+        )
+
+    print_table(("TARGET", "START", "END", "DURATION"), output_rows)
+    return 0
+
+
+def command_chart(args: argparse.Namespace) -> int:
+    now = int(time.time())
+    start = now - args.since
+    names = [args.target] if args.target else [target.name for target in TARGETS]
+    terminal_width = shutil.get_terminal_size((100, 24)).columns
+    name_width = max(len(name) for name in names)
+    chart_width = args.width or max(10, min(160, terminal_width - name_width - 2))
+    buckets = {name: ["?"] * chart_width for name in names}
+    priorities = {"?": 0, ".": 1, "E": 2, "!": 3, "X": 4}
+
+    placeholders = ",".join("?" for _ in names)
+    query = f"""
+        SELECT target, checked_at,
+               CASE WHEN interface IS NULL THEN 'unknown' ELSE status END AS status,
+               packets_sent, packets_received
+        FROM samples
+        WHERE checked_at >= ? AND target IN ({placeholders})
+        ORDER BY checked_at, id
+    """
+    with open_database(args.database) as connection:
+        rows = list(connection.execute(query, (start, *names)))
+
+    for row in rows:
+        position = min(
+            chart_width - 1,
+            max(0, int((row["checked_at"] - start) * chart_width / args.since)),
+        )
+        if row["status"] == "down":
+            marker = "X"
+        elif row["status"] == "unknown":
+            marker = "E"
+        elif (
+            row["packets_sent"] is not None
+            and row["packets_received"] is not None
+            and row["packets_received"] < row["packets_sent"]
+        ):
+            marker = "!"
+        else:
+            marker = "."
+        if priorities[marker] > priorities[buckets[row["target"]][position]]:
+            buckets[row["target"]][position] = marker
+
+    print(f"{format_timestamp(start)}  ->  {format_timestamp(now)}")
+    for name in names:
+        print(f"{name:<{name_width}}  {''.join(buckets[name])}")
+    print(
+        "Legend: . reachable  ! partial packet loss  X unreachable  "
+        "E check error  ? no recorded data"
+    )
+    return 0
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Record and report ICMP availability for the configured VPS hosts.",
+    )
+    parser.add_argument(
+        "--database",
+        type=Path,
+        default=default_database_path(),
+        help="SQLite file (default: %(default)s)",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    check_parser = subparsers.add_parser("check", help="ping all targets and save one sample")
+    check_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="print only unreachable, partial-loss, or failed checks",
+    )
+    check_parser.add_argument(
+        "--interface",
+        default=os.environ.get("VPS_STATUS_MONITOR_INTERFACE", "auto"),
+        metavar="NAME",
+        help=(
+            "base network interface, or 'auto' to use the IPv4 default from "
+            "routing table main (default: %(default)s)"
+        ),
+    )
+    check_parser.set_defaults(handler=command_check)
+
+    status_parser = subparsers.add_parser("status", help="show the latest saved sample")
+    status_parser.set_defaults(handler=command_status)
+
+    target_choices = tuple(target.name for target in TARGETS)
+    outages_parser = subparsers.add_parser(
+        "outages", help="show intervals in which all three packets were lost"
+    )
+    outages_parser.add_argument(
+        "--since", type=parse_duration, default=parse_duration("7d"), metavar="DURATION"
+    )
+    outages_parser.add_argument("--target", choices=target_choices)
+    outages_parser.set_defaults(handler=command_outages)
+
+    chart_parser = subparsers.add_parser("chart", help="show a compact terminal timeline")
+    chart_parser.add_argument(
+        "--since", type=parse_duration, default=parse_duration("24h"), metavar="DURATION"
+    )
+    chart_parser.add_argument("--target", choices=target_choices)
+    chart_parser.add_argument(
+        "--width",
+        type=lambda value: max(10, min(500, int(value))),
+        help="number of timeline columns (default: fit the terminal)",
+    )
+    chart_parser.set_defaults(handler=command_chart)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = create_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.handler(args)
+    except (OSError, sqlite3.Error) as error:
+        print(f"{APP_NAME}: error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

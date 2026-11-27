@@ -1,0 +1,8 @@
+[Unit]
+Description=Check VPS reachability and record it in SQLite
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/vps-status-monitor check --quiet
+TimeoutStartSec=30s
+Nice=10
